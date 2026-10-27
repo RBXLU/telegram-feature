@@ -1,0 +1,307 @@
+diff --git a/src/assets/localization/fallback.strings b/src/assets/localization/fallback.strings
+index 085994f..f6c5a76 100644
+--- a/src/assets/localization/fallback.strings
++++ b/src/assets/localization/fallback.strings
+@@ -509,6 +509,8 @@
+ "SettingsKeyboard" = "Keyboard";
+ "SettingsAutomaticTextReplacements" = "Automatic text replacements";
+ "SettingsAutomaticTextReplacementsInfo" = "Convert --, << and >> as you type";
++"SettingsUndoSend" = "Undo send";
++"SettingsUndoSendInfo" = "Hold messages for 5 seconds so you can take them back";
+ "SettingsOfflineNotificationUnsupported" = "Not supported";
+ "TextSize" = "Message Font Size";
+ "ChatBackground" = "Chat Wallpaper";
+@@ -2432,6 +2434,7 @@
+ "MessageSentPaidToastTitle_other" = "{count} messages sent!";
+ "MessageSentPaidToastText" = "You paid {amount}";
+ "ButtonUndo" = "Undo";
++"UndoSendToastText" = "Sending message…";
+ "ActionPaidOneMessageOutgoing" = "You paid {amount} to send a message";
+ "ActionPaidOneMessageIncoming" = "{user} paid {amount} to send a message";
+ "PaneMessagePaidMessageCharge" = "{peer} must pay {amount} for each message to you.";
+diff --git a/src/components/left/settings/SettingsGeneral.tsx b/src/components/left/settings/SettingsGeneral.tsx
+index 01f6149..930b5cb 100644
+--- a/src/components/left/settings/SettingsGeneral.tsx
++++ b/src/components/left/settings/SettingsGeneral.tsx
+@@ -35,6 +35,7 @@ type StateProps =
+     'messageTextSize' |
+     'messageSendKeyCombo' |
+     'shouldReplaceTextShortcuts' |
++    'canUndoSend' |
+     'timeFormat' |
+     'theme' |
+     'shouldUseSystemTheme'
+@@ -45,6 +46,7 @@ const SettingsGeneral = ({
+   messageTextSize,
+   messageSendKeyCombo,
+   shouldReplaceTextShortcuts,
++  canUndoSend,
+   timeFormat,
+   theme,
+   shouldUseSystemTheme,
+@@ -118,6 +120,10 @@ const SettingsGeneral = ({
+     setSharedSettingOption({ shouldReplaceTextShortcuts: shouldReplace });
+   });
+ 
++  const handleUndoSendChange = useLastCallback((isEnabled: boolean) => {
++    setSharedSettingOption({ canUndoSend: isEnabled });
++  });
++
+   useHistoryBack({
+     isActive,
+     onBack: onReset,
+@@ -180,6 +186,12 @@ const SettingsGeneral = ({
+           checked={shouldReplaceTextShortcuts}
+           onCheck={handleTextShortcutReplacementChange}
+         />
++        <Checkbox
++          label={lang('SettingsUndoSend')}
++          subLabel={lang('SettingsUndoSendInfo')}
++          checked={Boolean(canUndoSend)}
++          onCheck={handleUndoSendChange}
++        />
+       </Island>
+     </div>
+   );
+@@ -192,6 +204,7 @@ export default memo(withGlobal<OwnProps>(
+       shouldUseSystemTheme,
+       messageSendKeyCombo,
+       shouldReplaceTextShortcuts,
++      canUndoSend,
+       messageTextSize,
+       timeFormat,
+     } = selectSharedSettings(global);
+@@ -199,6 +212,7 @@ export default memo(withGlobal<OwnProps>(
+     return {
+       messageSendKeyCombo,
+       shouldReplaceTextShortcuts,
++      canUndoSend,
+       messageTextSize,
+       timeFormat,
+       theme,
+diff --git a/src/components/left/settings/search/registry.ts b/src/components/left/settings/search/registry.ts
+index 6d96e92..cb00e4b 100644
+--- a/src/components/left/settings/search/registry.ts
++++ b/src/components/left/settings/search/registry.ts
+@@ -305,7 +305,7 @@ export const SETTINGS_SEARCH_ENTRIES: SettingsSearchEntry[] = [
+   ...buildEntries(SettingsScreens.General, ['SettingsTimeFormat'], { keywordsKey: 'SettingsKeywordsTimeFormat' }),
+   ...buildEntries(SettingsScreens.General, [
+     'EmptyChatAppearanceLight', 'EmptyChatAppearanceDark', 'EmptyChatAppearanceSystem', 'SettingsTimeFormat12',
+-    'SettingsTimeFormat24', 'SettingsAutomaticTextReplacements', 'SettingsKeyboard',
++    'SettingsTimeFormat24', 'SettingsAutomaticTextReplacements', 'SettingsUndoSend', 'SettingsKeyboard',
+   ]),
+   ...buildEntries(SettingsScreens.General, [
+     'SettingsSendEnter', IS_MAC_OS || IS_IOS ? 'SettingsSendCmdenter' : 'SettingsSendCtrlenter',
+diff --git a/src/global/actions/api/messages.ts b/src/global/actions/api/messages.ts
+index 53a5b09..bad3baf 100644
+--- a/src/global/actions/api/messages.ts
++++ b/src/global/actions/api/messages.ts
+@@ -182,6 +182,7 @@ import {
+   selectWebPage,
+ } from '../../selectors';
+ import { makeTrackKeyFromItem, selectPlaybackMedia } from '../../selectors/audioPlayer';
++import { selectSharedSettings } from '../../selectors/sharedState';
+ import {
+   selectDraft,
+   selectEditingId,
+@@ -210,17 +211,27 @@ type SendEphemeralMessagesParams = {
+   topMsgId?: number;
+ };
+ 
++type PendingUndoSend = {
++  chatId: string;
++  threadId: ThreadId;
++  messageId: number;
++  timeout: number;
++  draft?: ApiDraft;
++};
++
+ const AUTOLOGIN_TOKEN_KEY = 'autologin_token';
+ 
+ const SECOND_IN_MS = 1000;
+ // `setTimeout` overflows on delays over ~25 days, so long TTLs are awaited in day-long hops
+ const TTL_CLEANUP_MAX_DELAY = 24 * 60 * 60 * SECOND_IN_MS;
+ const TTL_CLEANUP_DELAY_BUFFER = SECOND_IN_MS;
++const UNDO_SEND_DELAY = 5 * SECOND_IN_MS;
+ 
+ const uploadProgressCallbacks = new Map<MessageKey, ApiOnProgress>();
+ 
+ const ttlCleanupTimersByChatId = new Map<string, { timer: number; expiresAt: number }>();
+ const audioForwardTokens = new Map<number, symbol>();
++const pendingUndoSends = new Map<MessageKey, PendingUndoSend>();
+ 
+ const runDebouncedForMarkRead = debounce((cb) => cb(), 500, false);
+ 
+@@ -659,6 +670,11 @@ addActionHandler('sendMessage', async (global, actions, payload): Promise<void>
+     });
+   }
+ 
++  // Text and sticker sends stay local until the undo window ends; media, forwards and paid sends are not delayed
++  const shouldDelayForUndo = Boolean(selectSharedSettings(global).canUndoSend
++    && !payload.scheduledAt && !isStoryReply && !messagePriceInStars && !isForwarding
++    && !payload.attachments?.length && !chat.isBotForum);
++
+   const areStickersDisabled = isUserRightBanned(chat, 'sendStickers');
+ 
+   const diceEmojies = global.appConfig.diceEmojies;
+@@ -682,7 +698,7 @@ addActionHandler('sendMessage', async (global, actions, payload): Promise<void>
+     text: !dice && !payload.richMessage ? payload.text : undefined,
+     entities: payload.richMessage ? undefined : payload.entities,
+     richMessage: payload.richMessage,
+-    isPending: messagePriceInStars ? true : undefined,
++    isPending: messagePriceInStars || shouldDelayForUndo ? true : undefined,
+     ...suggestedMessage && { isInvertedMedia: suggestedMessage?.isInvertedMedia },
+   };
+ 
+@@ -726,7 +742,22 @@ addActionHandler('sendMessage', async (global, actions, payload): Promise<void>
+       attachment: attachments ? attachments[0] : undefined,
+       wasDrafted: Boolean(draft),
+     };
+-    await sendMessageOrReduceLocal(global, sendParams, localMessages);
++
++    if (shouldDelayForUndo) {
++      const hasText = Boolean(payload.text || payload.richMessage);
++      await sendMessageWithUndo(sendParams, {
++        threadId: threadId!,
++        draft: hasText ? {
++          text: payload.text ? { text: payload.text, entities: payload.entities } : undefined,
++          richMessage: payload.richMessage,
++          replyInfo: draftReplyInfo,
++          effectId: payload.effectId,
++        } : undefined,
++        tabId,
++      });
++    } else {
++      await sendMessageOrReduceLocal(global, sendParams, localMessages);
++    }
+   } else if (isGrouped) {
+     const {
+       text, entities, attachments, ...commonParams
+@@ -1355,6 +1386,32 @@ addActionHandler('deleteEphemeralMessage', async (global, actions, payload): Pro
+   }
+ });
+ 
++addActionHandler('undoMessageSend', (global, actions, payload): ActionReturnType => {
++  const { messageKey, tabId = getCurrentTabId() } = payload;
++  const pendingSend = pendingUndoSends.get(messageKey);
++  if (!pendingSend) return;
++
++  clearTimeout(pendingSend.timeout);
++  pendingUndoSends.delete(messageKey);
++
++  const {
++    chatId, threadId, messageId, draft,
++  } = pendingSend;
++
++  // Text typed after sending takes priority over the cancelled message
++  if (draft && !selectDraft(global, chatId, threadId)) {
++    void saveDraft({
++      global, chatId, threadId, draft,
++    });
++  }
++
++  actions.deleteMessages({
++    messageIds: [messageId],
++    messageList: { chatId, threadId, type: 'thread' },
++    tabId,
++  });
++});
++
+ addActionHandler('resetLocalPaidMessages', (global, actions, payload): ActionReturnType => {
+   const { tabId = getCurrentTabId() } = payload || {};
+ 
+@@ -2466,6 +2523,39 @@ async function sendMessageOrReduceLocal<T extends GlobalState>(
+   }
+ }
+ 
++async function sendMessageWithUndo(
++  sendParams: SendMessageParams,
++  { threadId, draft, tabId }: { threadId: ThreadId; draft?: ApiDraft; tabId: number },
++) {
++  const localMessage = await callApi('sendMessageLocal', sendParams);
++  if (!localMessage) return;
++
++  const messageKey = getMessageKey(localMessage);
++  const timeout = window.setTimeout(() => {
++    pendingUndoSends.delete(messageKey);
++    getActions().sendMessages({ sendParams: [{ ...sendParams, localMessage }] });
++  }, UNDO_SEND_DELAY);
++
++  pendingUndoSends.set(messageKey, {
++    chatId: localMessage.chatId,
++    threadId,
++    messageId: localMessage.id,
++    timeout,
++    draft,
++  });
++
++  getActions().showNotification({
++    localId: messageKey,
++    message: { key: 'UndoSendToastText' },
++    actionText: { key: 'ButtonUndo' },
++    action: { action: 'undoMessageSend', payload: { messageKey } },
++    duration: UNDO_SEND_DELAY,
++    shouldShowTimer: true,
++    disableClickDismiss: true,
++    tabId,
++  });
++}
++
+ async function sendMessage<T extends GlobalState>(global: T, params: SendMessageParams) {
+   // @optimization
+   if (params.replyInfo || IS_IOS) {
+diff --git a/src/global/types/actions.ts b/src/global/types/actions.ts
+index f9fd0e1..69bca27 100644
+--- a/src/global/types/actions.ts
++++ b/src/global/types/actions.ts
+@@ -130,6 +130,7 @@ import type {
+ import type { BrowserModalStateType, BrowserTab } from '../../types/browser';
+ import type { ClipboardTextFormat, MessageCopyRequest } from '../../types/messageCopy';
+ import type { WebApp, WebAppOutboundEvent } from '../../types/webapp';
++import type { MessageKey } from '../../util/keys/messageKey';
+ import type { RegularLangFnParameters } from '../../util/localization';
+ import type { DownloadableMedia } from '../helpers';
+ import type { SharedState } from './sharedState';
+@@ -552,6 +553,9 @@ export interface ActionPayloads {
+   sendMessages: {
+     sendParams: SendMessageParams[];
+   };
++  undoMessageSend: {
++    messageKey: MessageKey;
++  } & WithTabId;
+   sendDiceInCurrentChat: {
+     emoji: string;
+   } & WithTabId;
+diff --git a/src/global/types/sharedState.ts b/src/global/types/sharedState.ts
+index 92ca29f..6e58e1a 100644
+--- a/src/global/types/sharedState.ts
++++ b/src/global/types/sharedState.ts
+@@ -25,6 +25,7 @@ export interface SharedSettings {
+   wasAnimationLevelSetManually?: boolean;
+   messageSendKeyCombo: 'enter' | 'ctrl-enter';
+   shouldReplaceTextShortcuts: boolean;
++  canUndoSend?: boolean;
+   browserCachedPosition?: Point;
+   browserCachedSize?: Size;
+   timeFormat: TimeFormat;
+diff --git a/src/types/language.d.ts b/src/types/language.d.ts
+index 1db1660..35ba898 100644
+--- a/src/types/language.d.ts
++++ b/src/types/language.d.ts
+@@ -420,6 +420,8 @@ export interface LangPair {
+   'SettingsKeyboard': undefined;
+   'SettingsAutomaticTextReplacements': undefined;
+   'SettingsAutomaticTextReplacementsInfo': undefined;
++  'SettingsUndoSend': undefined;
++  'SettingsUndoSendInfo': undefined;
+   'SettingsOfflineNotificationUnsupported': undefined;
+   'TextSize': undefined;
+   'ChatBackground': undefined;
+@@ -1820,6 +1822,7 @@ export interface LangPair {
+   'ButtonBuyStars': undefined;
+   'TitleConfirmPayment': undefined;
+   'ButtonUndo': undefined;
++  'UndoSendToastText': undefined;
+   'ConfirmRemoveMessageFee': undefined;
+   'StoryTooltipGifSent': undefined;
+   'StoryTooltipStickerSent': undefined;
